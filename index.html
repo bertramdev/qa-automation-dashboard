@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QA Automation Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --card-bg: #ffffff;
+    --border: #e2e5ea;
+    --text: #1a1d23;
+    --text-muted: #6b7280;
+    --accent: #3b5bdb;
+    --pass: #2f9e44;
+    --fail: #e03131;
+    --flaky: #f08c00;
+    --skip: #868e96;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --card-bg: #1c1f26;
+      --border: #2c313a;
+      --text: #e8eaed;
+      --text-muted: #9aa1ab;
+      --accent: #6d8dff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 24px 32px 12px;
+  }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--text-muted); font-size: 13px; }
+  main { padding: 8px 32px 48px; max-width: 1400px; margin: 0 auto; }
+  section { margin-top: 28px; }
+  section h2 {
+    font-size: 15px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin: 0 0 12px;
+  }
+  .controls {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .controls label {
+    display: flex;
+    flex-direction: column;
+    font-size: 11px;
+    color: var(--text-muted);
+    gap: 4px;
+  }
+  select {
+    background: var(--card-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    min-width: 140px;
+  }
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    border-left: 4px solid var(--skip);
+  }
+  .card.status-passed { border-left-color: var(--pass); }
+  .card.status-failed { border-left-color: var(--fail); }
+  .card .card-title { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
+  .card .card-sub { font-size: 11px; color: var(--text-muted); margin-bottom: 10px; }
+  .card .counts { display: flex; gap: 10px; font-size: 12px; flex-wrap: wrap; }
+  .count-pill { padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+  .count-pill.pass { background: color-mix(in srgb, var(--pass) 18%, transparent); color: var(--pass); }
+  .count-pill.fail { background: color-mix(in srgb, var(--fail) 18%, transparent); color: var(--fail); }
+  .count-pill.flaky { background: color-mix(in srgb, var(--flaky) 18%, transparent); color: var(--flaky); }
+  .count-pill.skip { background: color-mix(in srgb, var(--skip) 18%, transparent); color: var(--skip); }
+  .card .meta { margin-top: 10px; font-size: 11px; color: var(--text-muted); }
+  .card .meta a { color: var(--accent); text-decoration: none; }
+  .empty-note {
+    color: var(--text-muted);
+    font-size: 13px;
+    padding: 24px;
+    text-align: center;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+  }
+  .chart-wrap {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    height: 360px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>QA Automation Dashboard</h1>
+  <p>Cypress CI results across all bertramdev *-qa projects</p>
+</header>
+
+<main>
+  <section>
+    <h2>Current State</h2>
+    <div class="controls">
+      <label>Project
+        <select id="stateProjectFilter"><option value="">All</option></select>
+      </label>
+      <label>Environment
+        <select id="stateEnvFilter"><option value="">All</option></select>
+      </label>
+      <label>Browser
+        <select id="stateBrowserFilter"><option value="">All</option></select>
+      </label>
+    </div>
+    <div id="currentStateGrid" class="card-grid"></div>
+  </section>
+
+  <section>
+    <h2>Time Series</h2>
+    <div class="controls">
+      <label>Window
+        <select id="windowSelect">
+          <option value="1">Last 1 day</option>
+          <option value="7" selected>Last 1 week</option>
+          <option value="30">Last 1 month</option>
+        </select>
+      </label>
+      <label>Project
+        <select id="seriesProjectFilter"><option value="">All</option></select>
+      </label>
+      <label>Environment
+        <select id="seriesEnvFilter"><option value="">All</option></select>
+      </label>
+      <label>Browser
+        <select id="seriesBrowserFilter"><option value="">All</option></select>
+      </label>
+      <label>Metric
+        <select id="metricSelect">
+          <option value="counts">Passed / Failed / Flaky (counts)</option>
+          <option value="passrate">Pass rate (%)</option>
+        </select>
+      </label>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="timeSeriesChart"></canvas>
+    </div>
+  </section>
+</main>
+
+<script>
+// Known *-qa projects this dashboard aggregates. Each publishes to its own
+// data/<project>.json file — a plain fetch (via GitHub Pages, same-origin) rather
+// than a Contents-API directory listing, so reads never hit GitHub's unauthenticated
+// API rate limit. A 404 for a project that hasn't published a run yet is expected
+// and silently skipped. Add a new project's slug here once its workflow starts
+// publishing.
+const PROJECTS = [
+  'leftlane-wheelhouse-qa',
+  'equivate-qa',
+  'ridgeline-insurance-app-qa',
+  'mse-zendesk-app-qa',
+  'mse-shopify-site-qa',
+  'mse-shopify-app-qa',
+];
+
+let allRuns = [];
+
+async function loadAllRuns() {
+  const results = await Promise.all(PROJECTS.map(async (project) => {
+    try {
+      const res = await fetch(`data/${project}.json`, { cache: 'no-store' });
+      if (!res.ok) return [];
+      const runs = await res.json();
+      return Array.isArray(runs) ? runs : [];
+    } catch {
+      return [];
+    }
+  }));
+  return results.flat();
+}
+
+function populateFilterOptions(selectEl, values) {
+  const current = selectEl.value;
+  const existing = new Set(Array.from(selectEl.options).map(o => o.value));
+  [...values].sort().forEach((v) => {
+    if (!existing.has(v)) {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v;
+      selectEl.appendChild(opt);
+    }
+  });
+  if (current) selectEl.value = current;
+}
+
+function renderCurrentState() {
+  const projectFilter = document.getElementById('stateProjectFilter').value;
+  const envFilter = document.getElementById('stateEnvFilter').value;
+  const browserFilter = document.getElementById('stateBrowserFilter').value;
+
+  const latestByKey = new Map();
+  for (const run of allRuns) {
+    if (projectFilter && run.project !== projectFilter) continue;
+    if (envFilter && run.environment !== envFilter) continue;
+    if (browserFilter && run.browser !== browserFilter) continue;
+    const key = `${run.project}::${run.environment}::${run.browser}`;
+    const existing = latestByKey.get(key);
+    if (!existing || new Date(run.timestamp) > new Date(existing.timestamp)) {
+      latestByKey.set(key, run);
+    }
+  }
+
+  const grid = document.getElementById('currentStateGrid');
+  grid.innerHTML = '';
+  const entries = Array.from(latestByKey.values()).sort((a, b) => a.project.localeCompare(b.project) || a.environment.localeCompare(b.environment));
+
+  if (entries.length === 0) {
+    grid.innerHTML = '<div class="empty-note">No run data yet for this filter combination.</div>';
+    return;
+  }
+
+  for (const run of entries) {
+    const statusClass = run.status === 'PASSED' ? 'status-passed' : 'status-failed';
+    const card = document.createElement('div');
+    card.className = `card ${statusClass}`;
+    const runUrl = run.run_url || '#';
+    card.innerHTML = `
+      <div class="card-title">${run.project}</div>
+      <div class="card-sub">${run.environment} &middot; ${run.browser}</div>
+      <div class="counts">
+        <span class="count-pill pass">${run.passed ?? 0} passed</span>
+        <span class="count-pill fail">${run.failed ?? 0} failed</span>
+        ${run.flaky ? `<span class="count-pill flaky">${run.flaky} flaky</span>` : ''}
+        ${run.skipped ? `<span class="count-pill skip">${run.skipped} skipped</span>` : ''}
+      </div>
+      <div class="meta">
+        ${new Date(run.timestamp).toLocaleString()} &middot;
+        <a href="${runUrl}" target="_blank" rel="noopener">view run</a>
+      </div>
+    `;
+    grid.appendChild(card);
+  }
+}
+
+let chartInstance = null;
+
+function renderTimeSeries() {
+  const windowDays = Number(document.getElementById('windowSelect').value);
+  const projectFilter = document.getElementById('seriesProjectFilter').value;
+  const envFilter = document.getElementById('seriesEnvFilter').value;
+  const browserFilter = document.getElementById('seriesBrowserFilter').value;
+  const metric = document.getElementById('metricSelect').value;
+
+  const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+  const filtered = allRuns
+    .filter((r) => new Date(r.timestamp).getTime() >= cutoff)
+    .filter((r) => !projectFilter || r.project === projectFilter)
+    .filter((r) => !envFilter || r.environment === envFilter)
+    .filter((r) => !browserFilter || r.browser === browserFilter)
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+  const labels = filtered.map((r) => new Date(r.timestamp).toLocaleString());
+  let datasets;
+  if (metric === 'passrate') {
+    datasets = [{
+      label: 'Pass rate (%)',
+      data: filtered.map((r) => {
+        const total = (r.passed ?? 0) + (r.failed ?? 0);
+        return total > 0 ? Math.round(((r.passed ?? 0) / total) * 1000) / 10 : null;
+      }),
+      borderColor: '#3b5bdb',
+      backgroundColor: 'rgba(59, 91, 219, 0.15)',
+      tension: 0.2,
+      fill: true,
+    }];
+  } else {
+    datasets = [
+      { label: 'Passed', data: filtered.map((r) => r.passed ?? 0), borderColor: '#2f9e44', backgroundColor: 'rgba(47,158,68,0.15)', tension: 0.2 },
+      { label: 'Failed', data: filtered.map((r) => r.failed ?? 0), borderColor: '#e03131', backgroundColor: 'rgba(224,49,49,0.15)', tension: 0.2 },
+      { label: 'Flaky', data: filtered.map((r) => r.flaky ?? 0), borderColor: '#f08c00', backgroundColor: 'rgba(240,140,0,0.15)', tension: 0.2 },
+    ];
+  }
+
+  const ctx = document.getElementById('timeSeriesChart').getContext('2d');
+  if (chartInstance) chartInstance.destroy();
+  chartInstance = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { y: { beginAtZero: true } },
+      plugins: { legend: { position: 'bottom' } },
+    },
+  });
+}
+
+function wireControls() {
+  ['stateProjectFilter', 'stateEnvFilter', 'stateBrowserFilter'].forEach((id) =>
+    document.getElementById(id).addEventListener('change', renderCurrentState)
+  );
+  ['windowSelect', 'seriesProjectFilter', 'seriesEnvFilter', 'seriesBrowserFilter', 'metricSelect'].forEach((id) =>
+    document.getElementById(id).addEventListener('change', renderTimeSeries)
+  );
+}
+
+async function init() {
+  allRuns = await loadAllRuns();
+
+  const projects = new Set(allRuns.map((r) => r.project));
+  const envs = new Set(allRuns.map((r) => r.environment));
+  const browsers = new Set(allRuns.map((r) => r.browser));
+
+  ['stateProjectFilter', 'seriesProjectFilter'].forEach((id) => populateFilterOptions(document.getElementById(id), projects));
+  ['stateEnvFilter', 'seriesEnvFilter'].forEach((id) => populateFilterOptions(document.getElementById(id), envs));
+  ['stateBrowserFilter', 'seriesBrowserFilter'].forEach((id) => populateFilterOptions(document.getElementById(id), browsers));
+
+  wireControls();
+  renderCurrentState();
+  renderTimeSeries();
+}
+
+init();
+</script>
+
+</body>
+</html>

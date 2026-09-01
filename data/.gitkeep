@@ -1,0 +1,2 @@
+Per-project run-history files land here as data/<project>.json (see ../README.md).
+This directory starts empty except for this placeholder.
