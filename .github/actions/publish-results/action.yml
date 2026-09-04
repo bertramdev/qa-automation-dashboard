@@ -1,0 +1,241 @@
+name: 'Publish QA results'
+description: >
+  Publishes one CI test run's aggregated results to whichever result "sinks" are
+  configured via inputs. Every sink is independently optional and silent by
+  default — leaving a sink's token/id unset skips only that sink, and no sink's
+  failure ever fails the calling job (a results-publishing outage must never
+  fail CI). This is the single place the canonical result schema and the sink
+  list live; calling workflows only ever pass already-computed metrics in.
+  To add a new sink (e.g. monday.com is already wired below as a template),
+  add one optional input pair plus one `if: always() && inputs.X != ''` step at
+  the bottom of this file — never touch a calling workflow, and never change
+  the schema fields already in use by an existing sink.
+
+inputs:
+  # --- Canonical result fields (see README.md's "Data schema" section) ---
+  project:
+    description: 'Project slug, e.g. leftlane-wheelhouse-qa. Used as the dashboard sink filename and the monday.com item name.'
+    required: true
+  repo:
+    description: 'owner/repo of the project whose CI produced this run, e.g. bertramdev/leftlane-wheelhouse-qa (pass github.repository).'
+    required: true
+  run_id:
+    required: true
+  run_url:
+    required: true
+  environment:
+    description: "e.g. qa, uat"
+    required: true
+  browser:
+    required: true
+  status:
+    description: "'PASSED' or 'FAILED'"
+    required: true
+  passed:
+    required: true
+  failed:
+    required: true
+  flaky:
+    required: true
+  skipped:
+    required: true
+  specs_unrun:
+    required: true
+  elapsed_seconds:
+    required: true
+  cost_usd:
+    required: true
+  commit_sha:
+    required: true
+  cloud_url:
+    required: false
+    default: ''
+
+  # --- Sink: GitHub-Pages-backed dashboard repo (data/<project>.json) ---
+  dashboard_token:
+    description: >
+      Fine-grained GitHub PAT (Contents: Read and write) scoped only to
+      dashboard_repo. Leave unset to skip this sink entirely (no-op, not a
+      failure) — e.g. before the token has been provisioned yet.
+    required: false
+    default: ''
+  dashboard_repo:
+    description: 'owner/repo holding the dashboard site + data/<project>.json files.'
+    required: false
+    default: 'bertramdev/qa-automation-dashboard'
+
+  # --- Sink: monday.com board (template — see README before enabling) ---
+  monday_api_token:
+    description: >
+      monday.com API v2 token. Leave unset to skip this sink entirely. NOTE:
+      this sink has not been exercised against a real board — no board/schema
+      has been defined for this org yet. It creates one item per run named
+      by monday_item_name (or a sensible default) and, if monday_column_values
+      is supplied, sets that item's columns. Column-ID mapping is the caller's
+      responsibility (see README) since it depends on a board this action has
+      no knowledge of.
+    required: false
+    default: ''
+  monday_board_id:
+    description: 'monday.com board ID to create an item on. Leave unset to skip this sink entirely.'
+    required: false
+    default: ''
+  monday_item_name:
+    description: 'Item name for the created monday.com item. Defaults to "<project> — run <run_id> (<status>)" if left blank.'
+    required: false
+    default: ''
+  monday_column_values:
+    description: >
+      Pre-built monday.com column_values JSON string (as monday's create_item
+      mutation expects — column IDs are board-specific, so this action does not
+      construct it for you). Leave blank to create the item with no column
+      values set beyond its name.
+    required: false
+    default: ''
+
+outputs:
+  published_dashboard:
+    description: "'true' if the dashboard sink published successfully this run, 'false' otherwise (including when skipped)."
+    value: ${{ steps.dashboard.outputs.published || 'false' }}
+  published_monday:
+    description: "'true' if the monday.com sink published successfully this run, 'false' otherwise (including when skipped)."
+    value: ${{ steps.monday.outputs.published || 'false' }}
+
+runs:
+  using: composite
+  steps:
+    # Single source of truth for the result schema every sink below sends —
+    # keeps every sink's payload in lockstep with README's documented schema
+    # without each sink re-deriving it independently.
+    - name: Build canonical result JSON
+      id: build
+      shell: bash
+      run: |
+        NEW_RUN=$(jq -n \
+          --arg project "${{ inputs.project }}" \
+          --arg repo "${{ inputs.repo }}" \
+          --argjson run_id "${{ inputs.run_id }}" \
+          --arg run_url "${{ inputs.run_url }}" \
+          --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg environment "${{ inputs.environment }}" \
+          --arg browser "${{ inputs.browser }}" \
+          --arg status "${{ inputs.status }}" \
+          --argjson passed "${{ inputs.passed }}" \
+          --argjson failed "${{ inputs.failed }}" \
+          --argjson flaky "${{ inputs.flaky }}" \
+          --argjson skipped "${{ inputs.skipped }}" \
+          --argjson specs_unrun "${{ inputs.specs_unrun }}" \
+          --argjson elapsed_seconds "${{ inputs.elapsed_seconds }}" \
+          --argjson cost_usd "${{ inputs.cost_usd }}" \
+          --arg commit_sha "${{ inputs.commit_sha }}" \
+          --arg cloud_url "${{ inputs.cloud_url }}" \
+          '{project:$project,repo:$repo,run_id:$run_id,run_url:$run_url,timestamp:$timestamp,environment:$environment,browser:$browser,status:$status,passed:$passed,failed:$failed,flaky:$flaky,skipped:$skipped,specs_unrun:$specs_unrun,elapsed_seconds:$elapsed_seconds,cost_usd:$cost_usd,commit_sha:$commit_sha,cloud_url:(if $cloud_url == "" then null else $cloud_url end)}')
+        {
+          echo "json<<PUBLISH_RESULTS_JSON_EOF"
+          echo "$NEW_RUN"
+          echo "PUBLISH_RESULTS_JSON_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    # Sink: GitHub dashboard repo. Appends to data/<project>.json via the
+    # Contents API's get-sha-then-PUT pattern (no local clone of the dashboard
+    # repo needed), retried a few times on a 409/422 conflict from another
+    # concurrent run updating the same file.
+    - name: 'Sink: GitHub dashboard (data/<project>.json)'
+      id: dashboard
+      if: always() && inputs.dashboard_token != ''
+      shell: bash
+      env:
+        DASHBOARD_TOKEN: ${{ inputs.dashboard_token }}
+        NEW_RUN: ${{ steps.build.outputs.json }}
+      run: |
+        FILE_PATH="data/${{ inputs.project }}.json"
+        PUBLISHED=false
+        for attempt in 1 2 3; do
+          EXISTING_JSON=$(curl -sf \
+            -H "Authorization: Bearer $DASHBOARD_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ inputs.dashboard_repo }}/contents/${FILE_PATH}" 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_JSON" ]; then
+            SHA=$(echo "$EXISTING_JSON" | jq -r '.sha')
+            CURRENT_ARRAY=$(echo "$EXISTING_JSON" | jq -r '.content' | base64 -d 2>/dev/null || echo "[]")
+          else
+            SHA=""
+            CURRENT_ARRAY="[]"
+          fi
+
+          UPDATED_ARRAY=$(echo "$CURRENT_ARRAY" | jq --argjson new "$NEW_RUN" '. + [$new]')
+          ENCODED_CONTENT=$(echo "$UPDATED_ARRAY" | base64 | tr -d '\n')
+
+          PAYLOAD=$(jq -n \
+            --arg message "Add ${{ inputs.project }} run ${{ inputs.run_id }}" \
+            --arg content "$ENCODED_CONTENT" \
+            --arg sha "$SHA" \
+            'if $sha == "" then {message:$message, content:$content} else {message:$message, content:$content, sha:$sha} end')
+
+          HTTP_CODE=$(curl -s -o /tmp/dashboard_publish_response.json -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer $DASHBOARD_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ inputs.dashboard_repo }}/contents/${FILE_PATH}" \
+            -d "$PAYLOAD")
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Published ${{ inputs.project }} run ${{ inputs.run_id }} to QA dashboard (attempt ${attempt})."
+            PUBLISHED=true
+            break
+          fi
+
+          echo "Dashboard publish attempt ${attempt} failed (HTTP ${HTTP_CODE}) — $(cat /tmp/dashboard_publish_response.json 2>/dev/null)"
+          sleep $((attempt * 2))
+        done
+
+        echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+        if [ "$PUBLISHED" != "true" ]; then
+          echo "::warning::Failed to publish ${{ inputs.project }} run ${{ inputs.run_id }} to the QA dashboard after 3 attempts. Not failing the job."
+        fi
+
+    # Sink: monday.com board — template/reference implementation. Creates one
+    # item per run via the create_item GraphQL mutation. Left unexercised
+    # against a real board until monday_board_id/monday_api_token are actually
+    # provisioned; see README's "Adding a new sink" section before enabling.
+    - name: 'Sink: monday.com (create_item)'
+      id: monday
+      if: always() && inputs.monday_api_token != '' && inputs.monday_board_id != ''
+      shell: bash
+      env:
+        MONDAY_API_TOKEN: ${{ inputs.monday_api_token }}
+      run: |
+        ITEM_NAME="${{ inputs.monday_item_name }}"
+        if [ -z "$ITEM_NAME" ]; then
+          ITEM_NAME="${{ inputs.project }} — run ${{ inputs.run_id }} (${{ inputs.status }})"
+        fi
+        COLUMN_VALUES='${{ inputs.monday_column_values }}'
+        [ -z "$COLUMN_VALUES" ] && COLUMN_VALUES='{}'
+
+        QUERY='mutation ($boardId: ID!, $itemName: String!, $columnValues: JSON) { create_item (board_id: $boardId, item_name: $itemName, column_values: $columnValues) { id } }'
+        PAYLOAD=$(jq -n \
+          --arg query "$QUERY" \
+          --arg boardId "${{ inputs.monday_board_id }}" \
+          --arg itemName "$ITEM_NAME" \
+          --argjson columnValues "$COLUMN_VALUES" \
+          '{query:$query, variables:{boardId:$boardId, itemName:$itemName, columnValues:($columnValues|tojson)}}')
+
+        HTTP_CODE=$(curl -s -o /tmp/monday_publish_response.json -w "%{http_code}" -X POST \
+          -H "Authorization: $MONDAY_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -H "API-Version: 2026-01" \
+          "https://api.monday.com/v2" \
+          -d "$PAYLOAD")
+
+        PUBLISHED=false
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ] && ! jq -e '.errors' /tmp/monday_publish_response.json >/dev/null 2>&1; then
+          echo "Published ${{ inputs.project }} run ${{ inputs.run_id }} to monday.com board ${{ inputs.monday_board_id }}."
+          PUBLISHED=true
+        else
+          echo "monday.com publish failed (HTTP ${HTTP_CODE}) — $(cat /tmp/monday_publish_response.json 2>/dev/null)"
+        fi
+
+        echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+        if [ "$PUBLISHED" != "true" ]; then
+          echo "::warning::Failed to publish ${{ inputs.project }} run ${{ inputs.run_id }} to monday.com. Not failing the job."
+        fi
