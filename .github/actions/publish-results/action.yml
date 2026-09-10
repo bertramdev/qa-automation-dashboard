@@ -118,6 +118,20 @@ inputs:
       (along with grafana_loki_url) to skip this sink entirely.
     required: false
     default: ''
+  spec_timings_json:
+    description: >
+      Optional JSON array of this run's per-spec timings, e.g.
+      [{"spec":"01-login.cy.js","duration_seconds":42.1}, ...]. When set (and
+      the Grafana Loki sink is active), each entry is pushed as its own Loki
+      log line in a second, separate stream — additive to the run-level
+      record above, never a replacement for it. Ignored by every other sink
+      (GitHub dashboard, monday.com): this does not become part of the
+      canonical result JSON those sinks read, since appending a per-spec
+      array to a git-committed, unboundedly-growing data/<project>.json would
+      multiply its size by spec count on every run. Leave unset to skip —
+      no-op, not a failure, same as every other optional input here.
+    required: false
+    default: ''
 
 outputs:
   published_dashboard:
@@ -277,6 +291,13 @@ runs:
     # (passed/failed/flaky/skipped/specs_unrun/elapsed_seconds/cost_usd) back
     # out via LogQL's `| json` parser + `unwrap`, so no separate metrics
     # backend (Prometheus/Influx) is required to graph them.
+    #
+    # When spec_timings_json is also supplied, a second stream is added to
+    # the same push — one log line per spec, labeled job/project/environment/
+    # browser/type="spec" (still low-cardinality; `spec` itself is a field
+    # inside each line, never a label, since it's unbounded per-project).
+    # This is additive only: it never touches the run-level stream above or
+    # any other sink's payload.
     - name: 'Sink: Grafana Loki (structured log push)'
       id: grafana
       if: always() && inputs.grafana_loki_url != '' && inputs.grafana_loki_token != ''
@@ -286,10 +307,11 @@ runs:
         GRAFANA_LOKI_USER: ${{ inputs.grafana_loki_user }}
         GRAFANA_LOKI_TOKEN: ${{ inputs.grafana_loki_token }}
         NEW_RUN: ${{ steps.build.outputs.json }}
+        SPEC_TIMINGS_JSON: ${{ inputs.spec_timings_json }}
       run: |
         TS_NS=$(date -u +%s%N)
         LOG_LINE=$(echo "$NEW_RUN" | jq -c .)
-        STREAM=$(jq -n \
+        RUN_STREAM=$(jq -n \
           --arg job "qa-automation-dashboard" \
           --arg project "${{ inputs.project }}" \
           --arg environment "${{ inputs.environment }}" \
@@ -297,7 +319,45 @@ runs:
           --arg status "${{ inputs.status }}" \
           --arg ts "$TS_NS" \
           --arg line "$LOG_LINE" \
-          '{streams: [{stream: {job:$job, project:$project, environment:$environment, browser:$browser, status:$status}, values: [[$ts, $line]]}]}')
+          '{stream: {job:$job, project:$project, environment:$environment, browser:$browser, status:$status}, values: [[$ts, $line]]}')
+
+        STREAMS_ARGS=(--argjson runStream "$RUN_STREAM")
+        STREAMS_FILTER='[$runStream]'
+
+        if [ -n "$SPEC_TIMINGS_JSON" ]; then
+          if echo "$SPEC_TIMINGS_JSON" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            # Every value in this stream shares $TS_NS — Loki only dedups a
+            # value when *both* its timestamp and its log line exactly match
+            # an existing entry, so same-timestamp/different-content entries
+            # (one per spec) are all stored. Deliberately not incrementing
+            # the timestamp per entry: jq's doubles can't hold a nanosecond
+            # epoch value losslessly (>2^53), so integer arithmetic on it
+            # here would silently corrupt the timestamp — kept as an opaque
+            # string throughout instead, exactly like the run-level stream.
+            SPEC_STREAM=$(echo "$SPEC_TIMINGS_JSON" | jq -c \
+              --arg job "qa-automation-dashboard" \
+              --arg project "${{ inputs.project }}" \
+              --arg environment "${{ inputs.environment }}" \
+              --arg browser "${{ inputs.browser }}" \
+              --argjson run_id "${{ inputs.run_id }}" \
+              --arg run_url "${{ inputs.run_url }}" \
+              --arg commit_sha "${{ inputs.commit_sha }}" \
+              --arg ts "$TS_NS" \
+              '{
+                stream: {job:$job, project:$project, environment:$environment, browser:$browser, type:"spec"},
+                values: [.[] | [
+                  $ts,
+                  (. + {project:$project, environment:$environment, browser:$browser, run_id:$run_id, run_url:$run_url, commit_sha:$commit_sha} | tojson)
+                ]]
+              }')
+            STREAMS_ARGS+=(--argjson specStream "$SPEC_STREAM")
+            STREAMS_FILTER='[$runStream, $specStream]'
+          else
+            echo "::warning::spec_timings_json is set but not a non-empty JSON array — skipping the per-spec Loki stream this run (run-level publish still proceeds)."
+          fi
+        fi
+
+        STREAM=$(jq -n "${STREAMS_ARGS[@]}" "{streams: $STREAMS_FILTER}")
 
         if [ -n "$GRAFANA_LOKI_USER" ]; then
           AUTH_ARGS=(-u "${GRAFANA_LOKI_USER}:${GRAFANA_LOKI_TOKEN}")
