@@ -321,11 +321,16 @@ runs:
           --arg line "$LOG_LINE" \
           '{stream: {job:$job, project:$project, environment:$environment, browser:$browser, status:$status}, values: [[$ts, $line]]}')
 
-        STREAMS_ARGS=(--argjson runStream "$RUN_STREAM")
-        STREAMS_FILTER='[$runStream]'
+        # SPEC_STREAM stays the string "null" (not built at all) unless a
+        # valid non-empty array of per-spec objects is supplied below; the
+        # final jq call folds it into the payload only when it isn't null.
+        SPEC_STREAM=null
 
         if [ -n "$SPEC_TIMINGS_JSON" ]; then
-          if echo "$SPEC_TIMINGS_JSON" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+          if echo "$SPEC_TIMINGS_JSON" | jq -e 'type == "array" and length == 0' >/dev/null 2>&1; then
+            : # Legitimate "no timed specs this run" case (e.g. a cancelled
+              # job) — nothing to add, no warning; run-level publish proceeds.
+          elif echo "$SPEC_TIMINGS_JSON" | jq -e 'type == "array" and length > 0 and all(.[]; type == "object")' >/dev/null 2>&1; then
             # Every value in this stream shares $TS_NS — Loki only dedups a
             # value when *both* its timestamp and its log line exactly match
             # an existing entry, so same-timestamp/different-content entries
@@ -350,14 +355,15 @@ runs:
                   (. + {project:$project, environment:$environment, browser:$browser, run_id:$run_id, run_url:$run_url, commit_sha:$commit_sha} | tojson)
                 ]]
               }')
-            STREAMS_ARGS+=(--argjson specStream "$SPEC_STREAM")
-            STREAMS_FILTER='[$runStream, $specStream]'
           else
-            echo "::warning::spec_timings_json is set but not a non-empty JSON array — skipping the per-spec Loki stream this run (run-level publish still proceeds)."
+            echo "::warning::spec_timings_json is set but not a valid non-empty JSON array of objects — skipping the per-spec Loki stream this run (run-level publish still proceeds)."
           fi
         fi
 
-        STREAM=$(jq -n "${STREAMS_ARGS[@]}" "{streams: $STREAMS_FILTER}")
+        STREAM=$(jq -n \
+          --argjson runStream "$RUN_STREAM" \
+          --argjson specStream "$SPEC_STREAM" \
+          '{streams: ([$runStream] + (if $specStream == null then [] else [$specStream] end))}')
 
         if [ -n "$GRAFANA_LOKI_USER" ]; then
           AUTH_ARGS=(-u "${GRAFANA_LOKI_USER}:${GRAFANA_LOKI_TOKEN}")
