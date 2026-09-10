@@ -93,6 +93,32 @@ inputs:
     required: false
     default: ''
 
+  # --- Sink: Grafana Loki (structured log push) ---
+  grafana_loki_url:
+    description: >
+      Base URL of the Grafana Loki push endpoint (e.g. a Grafana Cloud Loki
+      instance URL like https://logs-prod-006.grafana.net, or a self-hosted
+      Loki base URL — this action appends /loki/api/v1/push itself). Leave
+      unset to skip this sink entirely (no-op, not a failure) — e.g. before
+      the endpoint/credentials have been provisioned yet.
+    required: false
+    default: ''
+  grafana_loki_user:
+    description: >
+      Basic-auth username for the Loki endpoint (Grafana Cloud: your numeric
+      Loki tenant/instance ID). Leave blank to authenticate with a bearer
+      token instead (grafana_loki_token alone, no username) — self-hosted
+      Loki behind an auth proxy commonly expects this.
+    required: false
+    default: ''
+  grafana_loki_token:
+    description: >
+      Credential for the Loki endpoint — used as the Basic-auth password when
+      grafana_loki_user is set, or as a Bearer token otherwise. Leave unset
+      (along with grafana_loki_url) to skip this sink entirely.
+    required: false
+    default: ''
+
 outputs:
   published_dashboard:
     description: "'true' if the dashboard sink published successfully this run, 'false' otherwise (including when skipped)."
@@ -100,6 +126,9 @@ outputs:
   published_monday:
     description: "'true' if the monday.com sink published successfully this run, 'false' otherwise (including when skipped)."
     value: ${{ steps.monday.outputs.published || 'false' }}
+  published_grafana:
+    description: "'true' if the Grafana Loki sink published successfully this run, 'false' otherwise (including when skipped)."
+    value: ${{ steps.grafana.outputs.published || 'false' }}
 
 runs:
   using: composite
@@ -238,4 +267,59 @@ runs:
         echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
         if [ "$PUBLISHED" != "true" ]; then
           echo "::warning::Failed to publish ${{ inputs.project }} run ${{ inputs.run_id }} to monday.com. Not failing the job."
+        fi
+
+    # Sink: Grafana Loki. Pushes the canonical result as one structured JSON
+    # log line via Loki's push API, labeled by project/environment/browser/
+    # status only — deliberately low-cardinality labels (Loki bills/indexes
+    # by label cardinality); run_id/commit_sha/etc. stay inside the log line
+    # itself, not as labels. A Grafana dashboard reads the numeric fields
+    # (passed/failed/flaky/skipped/specs_unrun/elapsed_seconds/cost_usd) back
+    # out via LogQL's `| json` parser + `unwrap`, so no separate metrics
+    # backend (Prometheus/Influx) is required to graph them.
+    - name: 'Sink: Grafana Loki (structured log push)'
+      id: grafana
+      if: always() && inputs.grafana_loki_url != '' && inputs.grafana_loki_token != ''
+      shell: bash
+      env:
+        GRAFANA_LOKI_URL: ${{ inputs.grafana_loki_url }}
+        GRAFANA_LOKI_USER: ${{ inputs.grafana_loki_user }}
+        GRAFANA_LOKI_TOKEN: ${{ inputs.grafana_loki_token }}
+        NEW_RUN: ${{ steps.build.outputs.json }}
+      run: |
+        TS_NS=$(date -u +%s%N)
+        LOG_LINE=$(echo "$NEW_RUN" | jq -c .)
+        STREAM=$(jq -n \
+          --arg job "qa-automation-dashboard" \
+          --arg project "${{ inputs.project }}" \
+          --arg environment "${{ inputs.environment }}" \
+          --arg browser "${{ inputs.browser }}" \
+          --arg status "${{ inputs.status }}" \
+          --arg ts "$TS_NS" \
+          --arg line "$LOG_LINE" \
+          '{streams: [{stream: {job:$job, project:$project, environment:$environment, browser:$browser, status:$status}, values: [[$ts, $line]]}]}')
+
+        if [ -n "$GRAFANA_LOKI_USER" ]; then
+          AUTH_ARGS=(-u "${GRAFANA_LOKI_USER}:${GRAFANA_LOKI_TOKEN}")
+        else
+          AUTH_ARGS=(-H "Authorization: Bearer ${GRAFANA_LOKI_TOKEN}")
+        fi
+
+        HTTP_CODE=$(curl -s -o /tmp/grafana_publish_response.json -w "%{http_code}" -X POST \
+          "${AUTH_ARGS[@]}" \
+          -H "Content-Type: application/json" \
+          "${GRAFANA_LOKI_URL%/}/loki/api/v1/push" \
+          -d "$STREAM")
+
+        PUBLISHED=false
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "Published ${{ inputs.project }} run ${{ inputs.run_id }} to Grafana Loki."
+          PUBLISHED=true
+        else
+          echo "Grafana Loki publish failed (HTTP ${HTTP_CODE}) — $(cat /tmp/grafana_publish_response.json 2>/dev/null)"
+        fi
+
+        echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+        if [ "$PUBLISHED" != "true" ]; then
+          echo "::warning::Failed to publish ${{ inputs.project }} run ${{ inputs.run_id }} to Grafana Loki. Not failing the job."
         fi

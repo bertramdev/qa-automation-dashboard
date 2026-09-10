@@ -6,12 +6,13 @@ A static dashboard aggregating Cypress CI results across `bertramdev`'s `*-qa` t
 
 ## How it works
 
-Every `*-qa` project's CI workflow calls this repo's reusable **[`publish-results` composite action](.github/actions/publish-results/action.yml)** (`uses: bertramdev/qa-automation-dashboard/.github/actions/publish-results@main`) from the job that currently emails run results, passing in the metrics that job already computed. The action is **destination-agnostic**: it builds one canonical result JSON object, then hands it to whichever "sinks" are configured via that step's inputs. Today there are two sinks, both independently optional and both silent no-ops (never fail the calling job) when their credentials aren't set:
+Every `*-qa` project's CI workflow calls this repo's reusable **[`publish-results` composite action](.github/actions/publish-results/action.yml)** (`uses: bertramdev/qa-automation-dashboard/.github/actions/publish-results@main`) from the job that currently emails run results, passing in the metrics that job already computed. The action is **destination-agnostic**: it builds one canonical result JSON object, then hands it to whichever "sinks" are configured via that step's inputs. Today there are three sinks, all independently optional and all silent no-ops (never fail the calling job) when their credentials aren't set:
 
 - **GitHub dashboard sink** — appends the result to this repo's `data/<project>.json` via the GitHub Contents API (get current file SHA, append, PUT — retried a few times on conflict). `index.html` (plain HTML/JS, Chart.js via CDN, no build step) fetches each project's `data/<project>.json` directly — same-origin and rate-limit-free once served from GitHub Pages — and renders the two views client-side.
 - **monday.com sink** — a template/reference implementation (see "Adding a new sink" below) that creates one board item per run via monday's `create_item` GraphQL mutation. Not yet exercised against a real board — no board or column schema has been defined for this org.
+- **Grafana Loki sink** — pushes the canonical result as one structured JSON log line via Loki's push API (`POST <grafana_loki_url>/loki/api/v1/push`), labeled by `project`/`environment`/`browser`/`status` only (deliberately low-cardinality — `run_id`/`commit_sha`/etc. stay inside the log line, not as labels, since Loki bills/indexes by label cardinality). A Grafana dashboard queries the numeric fields back out via LogQL's `| json` parser + `unwrap`, so no separate Prometheus/InfluxDB backend is required just to graph pass/fail/flaky/elapsed-seconds/cost trends. Not yet exercised against a real Loki instance — no endpoint/credentials have been provisioned for this org yet.
 
-A calling workflow only ever passes in already-computed metrics; it never needs to know which sinks exist or how they work. Adding a third destination later (or swapping which one is actually live) means changing this one action, not every project's workflow.
+A calling workflow only ever passes in already-computed metrics; it never needs to know which sinks exist or how they work. Adding a fourth destination later (or swapping which one is actually live) means changing this one action, not every project's workflow.
 
 ## Data schema
 
@@ -65,8 +66,11 @@ The composite action's "Build canonical result JSON" step produces one entry sha
        commit_sha: ${{ env.DASHBOARD_COMMIT_SHA }}
        cloud_url: ${{ env.DASHBOARD_CLOUD_URL }}
        dashboard_token: ${{ secrets.DASHBOARD_TOKEN }}
+       grafana_loki_url: ${{ secrets.GRAFANA_LOKI_URL }}
+       grafana_loki_user: ${{ secrets.GRAFANA_LOKI_USER }}
+       grafana_loki_token: ${{ secrets.GRAFANA_LOKI_TOKEN }}
    ```
-   See any of `leftlane-wheelhouse-qa`, `equivate-qa`, `ridgeline-insurance-app-qa`, or `mse-zendesk-app-qa`'s `.github/workflows/cypress.yml` for a working reference — each already has this wired in (as a no-op, pending step 3 below).
+   See any of `leftlane-wheelhouse-qa`, `equivate-qa`, `ridgeline-insurance-app-qa`, or `mse-zendesk-app-qa`'s `.github/workflows/cypress.yml` for a working reference — each already has this wired in (as a no-op, pending step 3 below and/or "Going live" below).
 3. Add a `DASHBOARD_TOKEN` secret to that project's repo — a fine-grained GitHub PAT scoped to `Contents: Read and write` on this repo only — to actually turn the GitHub-dashboard sink on for that project.
 
 ## Adding a new sink
@@ -81,11 +85,12 @@ No calling workflow needs to change — every `*-qa` project already calls this 
 
 ## Going live
 
-Three independent switches, none flipped yet:
+Independent switches, none flipped yet:
 
 1. **Enable GitHub Pages** on this repo (Settings → Pages → source: `main` branch, `/` root) to get a public URL for `index.html`.
 2. **Provision a `DASHBOARD_TOKEN`** (fine-grained PAT, `Contents: Read and write`, scoped to this repo only) and add it as a secret on each `*-qa` project that should publish to the GitHub-dashboard sink.
 3. **Or/also provision monday.com credentials** (`monday_api_token`, `monday_board_id`, and a `monday_column_values` mapping once a real board/schema exists) if that sink is the one to go live with instead of or alongside the GitHub dashboard.
+4. **Or/also provision Grafana Loki credentials** to go live with that sink: a `GRAFANA_LOKI_URL` (the Loki instance's base URL — for Grafana Cloud, find this on the stack's "Details" page under the Loki data source, labeled "URL"), a `GRAFANA_LOKI_USER` (Grafana Cloud: the numeric Loki instance/tenant ID shown on that same page — leave unset for a self-hosted Loki that authenticates via bearer token instead), and a `GRAFANA_LOKI_TOKEN` (Grafana Cloud: an API key/access policy token with Loki write scope; self-hosted: whatever bearer token the endpoint expects). Add all three as secrets on each `*-qa` project that should publish to this sink. Once live, in Grafana: add a Loki data source pointed at the same URL, then build panels/dashboards using LogQL against the `job="qa-automation-dashboard"` stream, filtered by the `project`/`environment`/`browser`/`status` labels and `| json | unwrap <field>` for numeric panels (e.g. `passed`, `failed`, `flaky`, `elapsed_seconds`, `cost_usd`).
 
 ## Data retention
 
