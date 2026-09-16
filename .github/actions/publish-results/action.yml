@@ -6,15 +6,15 @@ description: >
   failure ever fails the calling job (a results-publishing outage must never
   fail CI). This is the single place the canonical result schema and the sink
   list live; calling workflows only ever pass already-computed metrics in.
-  To add a new sink (e.g. monday.com is already wired below as a template),
-  add one optional input pair plus one `if: always() && inputs.X != ''` step at
-  the bottom of this file — never touch a calling workflow, and never change
-  the schema fields already in use by an existing sink.
+  To add a new sink (see the GitHub-dashboard sink below for the shape one
+  takes), add one optional input pair plus one `if: always() && inputs.X !=
+  ''` step at the bottom of this file — never touch a calling workflow, and
+  never change the schema fields already in use by an existing sink.
 
 inputs:
   # --- Canonical result fields (see README.md's "Data schema" section) ---
   project:
-    description: 'Project slug, e.g. leftlane-wheelhouse-qa. Used as the dashboard sink filename and the monday.com item name.'
+    description: 'Project slug, e.g. leftlane-wheelhouse-qa. Used as the dashboard sink filename.'
     required: true
   repo:
     description: 'owner/repo of the project whose CI produced this run, e.g. bertramdev/leftlane-wheelhouse-qa (pass github.repository).'
@@ -64,85 +64,10 @@ inputs:
     required: false
     default: 'bertramdev/qa-automation-dashboard'
 
-  # --- Sink: monday.com board (template — see README before enabling) ---
-  monday_api_token:
-    description: >
-      monday.com API v2 token. Leave unset to skip this sink entirely. NOTE:
-      this sink has not been exercised against a real board — no board/schema
-      has been defined for this org yet. It creates one item per run named
-      by monday_item_name (or a sensible default) and, if monday_column_values
-      is supplied, sets that item's columns. Column-ID mapping is the caller's
-      responsibility (see README) since it depends on a board this action has
-      no knowledge of.
-    required: false
-    default: ''
-  monday_board_id:
-    description: 'monday.com board ID to create an item on. Leave unset to skip this sink entirely.'
-    required: false
-    default: ''
-  monday_item_name:
-    description: 'Item name for the created monday.com item. Defaults to "<project> — run <run_id> (<status>)" if left blank.'
-    required: false
-    default: ''
-  monday_column_values:
-    description: >
-      Pre-built monday.com column_values JSON string (as monday's create_item
-      mutation expects — column IDs are board-specific, so this action does not
-      construct it for you). Leave blank to create the item with no column
-      values set beyond its name.
-    required: false
-    default: ''
-
-  # --- Sink: Grafana Loki (structured log push) ---
-  grafana_loki_url:
-    description: >
-      Base URL of the Grafana Loki push endpoint (e.g. a Grafana Cloud Loki
-      instance URL like https://logs-prod-006.grafana.net, or a self-hosted
-      Loki base URL — this action appends /loki/api/v1/push itself). Leave
-      unset to skip this sink entirely (no-op, not a failure) — e.g. before
-      the endpoint/credentials have been provisioned yet.
-    required: false
-    default: ''
-  grafana_loki_user:
-    description: >
-      Basic-auth username for the Loki endpoint (Grafana Cloud: your numeric
-      Loki tenant/instance ID). Leave blank to authenticate with a bearer
-      token instead (grafana_loki_token alone, no username) — self-hosted
-      Loki behind an auth proxy commonly expects this.
-    required: false
-    default: ''
-  grafana_loki_token:
-    description: >
-      Credential for the Loki endpoint — used as the Basic-auth password when
-      grafana_loki_user is set, or as a Bearer token otherwise. Leave unset
-      (along with grafana_loki_url) to skip this sink entirely.
-    required: false
-    default: ''
-  spec_timings_json:
-    description: >
-      Optional JSON array of this run's per-spec timings, e.g.
-      [{"spec":"01-login.cy.js","duration_seconds":42.1}, ...]. When set (and
-      the Grafana Loki sink is active), each entry is pushed as its own Loki
-      log line in a second, separate stream — additive to the run-level
-      record above, never a replacement for it. Ignored by every other sink
-      (GitHub dashboard, monday.com): this does not become part of the
-      canonical result JSON those sinks read, since appending a per-spec
-      array to a git-committed, unboundedly-growing data/<project>.json would
-      multiply its size by spec count on every run. Leave unset to skip —
-      no-op, not a failure, same as every other optional input here.
-    required: false
-    default: ''
-
 outputs:
   published_dashboard:
     description: "'true' if the dashboard sink published successfully this run, 'false' otherwise (including when skipped)."
     value: ${{ steps.dashboard.outputs.published || 'false' }}
-  published_monday:
-    description: "'true' if the monday.com sink published successfully this run, 'false' otherwise (including when skipped)."
-    value: ${{ steps.monday.outputs.published || 'false' }}
-  published_grafana:
-    description: "'true' if the Grafana Loki sink published successfully this run, 'false' otherwise (including when skipped)."
-    value: ${{ steps.grafana.outputs.published || 'false' }}
 
 runs:
   using: composite
@@ -235,157 +160,4 @@ runs:
         echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
         if [ "$PUBLISHED" != "true" ]; then
           echo "::warning::Failed to publish ${{ inputs.project }} run ${{ inputs.run_id }} to the QA dashboard after 3 attempts. Not failing the job."
-        fi
-
-    # Sink: monday.com board — template/reference implementation. Creates one
-    # item per run via the create_item GraphQL mutation. Left unexercised
-    # against a real board until monday_board_id/monday_api_token are actually
-    # provisioned; see README's "Adding a new sink" section before enabling.
-    - name: 'Sink: monday.com (create_item)'
-      id: monday
-      if: always() && inputs.monday_api_token != '' && inputs.monday_board_id != ''
-      shell: bash
-      env:
-        MONDAY_API_TOKEN: ${{ inputs.monday_api_token }}
-      run: |
-        ITEM_NAME="${{ inputs.monday_item_name }}"
-        if [ -z "$ITEM_NAME" ]; then
-          ITEM_NAME="${{ inputs.project }} — run ${{ inputs.run_id }} (${{ inputs.status }})"
-        fi
-        COLUMN_VALUES='${{ inputs.monday_column_values }}'
-        [ -z "$COLUMN_VALUES" ] && COLUMN_VALUES='{}'
-
-        QUERY='mutation ($boardId: ID!, $itemName: String!, $columnValues: JSON) { create_item (board_id: $boardId, item_name: $itemName, column_values: $columnValues) { id } }'
-        PAYLOAD=$(jq -n \
-          --arg query "$QUERY" \
-          --arg boardId "${{ inputs.monday_board_id }}" \
-          --arg itemName "$ITEM_NAME" \
-          --argjson columnValues "$COLUMN_VALUES" \
-          '{query:$query, variables:{boardId:$boardId, itemName:$itemName, columnValues:($columnValues|tojson)}}')
-
-        HTTP_CODE=$(curl -s -o /tmp/monday_publish_response.json -w "%{http_code}" -X POST \
-          -H "Authorization: $MONDAY_API_TOKEN" \
-          -H "Content-Type: application/json" \
-          -H "API-Version: 2026-01" \
-          "https://api.monday.com/v2" \
-          -d "$PAYLOAD")
-
-        PUBLISHED=false
-        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ] && ! jq -e '.errors' /tmp/monday_publish_response.json >/dev/null 2>&1; then
-          echo "Published ${{ inputs.project }} run ${{ inputs.run_id }} to monday.com board ${{ inputs.monday_board_id }}."
-          PUBLISHED=true
-        else
-          echo "monday.com publish failed (HTTP ${HTTP_CODE}) — $(cat /tmp/monday_publish_response.json 2>/dev/null)"
-        fi
-
-        echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
-        if [ "$PUBLISHED" != "true" ]; then
-          echo "::warning::Failed to publish ${{ inputs.project }} run ${{ inputs.run_id }} to monday.com. Not failing the job."
-        fi
-
-    # Sink: Grafana Loki. Pushes the canonical result as one structured JSON
-    # log line via Loki's push API, labeled by project/environment/browser/
-    # status only — deliberately low-cardinality labels (Loki bills/indexes
-    # by label cardinality); run_id/commit_sha/etc. stay inside the log line
-    # itself, not as labels. A Grafana dashboard reads the numeric fields
-    # (passed/failed/flaky/skipped/specs_unrun/elapsed_seconds/cost_usd) back
-    # out via LogQL's `| json` parser + `unwrap`, so no separate metrics
-    # backend (Prometheus/Influx) is required to graph them.
-    #
-    # When spec_timings_json is also supplied, a second stream is added to
-    # the same push — one log line per spec, labeled job/project/environment/
-    # browser/type="spec" (still low-cardinality; `spec` itself is a field
-    # inside each line, never a label, since it's unbounded per-project).
-    # This is additive only: it never touches the run-level stream above or
-    # any other sink's payload.
-    - name: 'Sink: Grafana Loki (structured log push)'
-      id: grafana
-      if: always() && inputs.grafana_loki_url != '' && inputs.grafana_loki_token != ''
-      shell: bash
-      env:
-        GRAFANA_LOKI_URL: ${{ inputs.grafana_loki_url }}
-        GRAFANA_LOKI_USER: ${{ inputs.grafana_loki_user }}
-        GRAFANA_LOKI_TOKEN: ${{ inputs.grafana_loki_token }}
-        NEW_RUN: ${{ steps.build.outputs.json }}
-        SPEC_TIMINGS_JSON: ${{ inputs.spec_timings_json }}
-      run: |
-        TS_NS=$(date -u +%s%N)
-        LOG_LINE=$(echo "$NEW_RUN" | jq -c .)
-        RUN_STREAM=$(jq -n \
-          --arg job "qa-automation-dashboard" \
-          --arg project "${{ inputs.project }}" \
-          --arg environment "${{ inputs.environment }}" \
-          --arg browser "${{ inputs.browser }}" \
-          --arg status "${{ inputs.status }}" \
-          --arg ts "$TS_NS" \
-          --arg line "$LOG_LINE" \
-          '{stream: {job:$job, project:$project, environment:$environment, browser:$browser, status:$status}, values: [[$ts, $line]]}')
-
-        # SPEC_STREAM stays the string "null" (not built at all) unless a
-        # valid non-empty array of per-spec objects is supplied below; the
-        # final jq call folds it into the payload only when it isn't null.
-        SPEC_STREAM=null
-
-        if [ -n "$SPEC_TIMINGS_JSON" ]; then
-          if echo "$SPEC_TIMINGS_JSON" | jq -e 'type == "array" and length == 0' >/dev/null 2>&1; then
-            : # Legitimate "no timed specs this run" case (e.g. a cancelled
-              # job) — nothing to add, no warning; run-level publish proceeds.
-          elif echo "$SPEC_TIMINGS_JSON" | jq -e 'type == "array" and length > 0 and all(.[]; type == "object")' >/dev/null 2>&1; then
-            # Every value in this stream shares $TS_NS — Loki only dedups a
-            # value when *both* its timestamp and its log line exactly match
-            # an existing entry, so same-timestamp/different-content entries
-            # (one per spec) are all stored. Deliberately not incrementing
-            # the timestamp per entry: jq's doubles can't hold a nanosecond
-            # epoch value losslessly (>2^53), so integer arithmetic on it
-            # here would silently corrupt the timestamp — kept as an opaque
-            # string throughout instead, exactly like the run-level stream.
-            SPEC_STREAM=$(echo "$SPEC_TIMINGS_JSON" | jq -c \
-              --arg job "qa-automation-dashboard" \
-              --arg project "${{ inputs.project }}" \
-              --arg environment "${{ inputs.environment }}" \
-              --arg browser "${{ inputs.browser }}" \
-              --argjson run_id "${{ inputs.run_id }}" \
-              --arg run_url "${{ inputs.run_url }}" \
-              --arg commit_sha "${{ inputs.commit_sha }}" \
-              --arg ts "$TS_NS" \
-              '{
-                stream: {job:$job, project:$project, environment:$environment, browser:$browser, type:"spec"},
-                values: [.[] | [
-                  $ts,
-                  (. + {project:$project, environment:$environment, browser:$browser, run_id:$run_id, run_url:$run_url, commit_sha:$commit_sha} | tojson)
-                ]]
-              }')
-          else
-            echo "::warning::spec_timings_json is set but not a valid non-empty JSON array of objects — skipping the per-spec Loki stream this run (run-level publish still proceeds)."
-          fi
-        fi
-
-        STREAM=$(jq -n \
-          --argjson runStream "$RUN_STREAM" \
-          --argjson specStream "$SPEC_STREAM" \
-          '{streams: ([$runStream] + (if $specStream == null then [] else [$specStream] end))}')
-
-        if [ -n "$GRAFANA_LOKI_USER" ]; then
-          AUTH_ARGS=(-u "${GRAFANA_LOKI_USER}:${GRAFANA_LOKI_TOKEN}")
-        else
-          AUTH_ARGS=(-H "Authorization: Bearer ${GRAFANA_LOKI_TOKEN}")
-        fi
-
-        HTTP_CODE=$(curl -s -o /tmp/grafana_publish_response.json -w "%{http_code}" -X POST \
-          "${AUTH_ARGS[@]}" \
-          -H "Content-Type: application/json" \
-          "${GRAFANA_LOKI_URL%/}/loki/api/v1/push" \
-          -d "$STREAM")
-
-        PUBLISHED=false
-        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-          echo "Published ${{ inputs.project }} run ${{ inputs.run_id }} to Grafana Loki."
-          PUBLISHED=true
-        else
-          echo "Grafana Loki publish failed (HTTP ${HTTP_CODE}) — $(cat /tmp/grafana_publish_response.json 2>/dev/null)"
-        fi
-
-        echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
-        if [ "$PUBLISHED" != "true" ]; then
-          echo "::warning::Failed to publish ${{ inputs.project }} run ${{ inputs.run_id }} to Grafana Loki. Not failing the job."
         fi
