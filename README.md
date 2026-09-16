@@ -6,17 +6,17 @@ A static dashboard aggregating Cypress CI results across `bertramdev`'s `*-qa` t
 
 ## How it works
 
-Every `*-qa` project's CI workflow calls this repo's reusable **[`publish-results` composite action](.github/actions/publish-results/action.yml)** (`uses: bertramdev/qa-automation-dashboard/.github/actions/publish-results@main`) from the job that currently emails run results, passing in the metrics that job already computed. The action is **destination-agnostic**: it builds one canonical result JSON object, then hands it to whichever "sinks" are configured via that step's inputs. Today there are three sinks, all independently optional and all silent no-ops (never fail the calling job) when their credentials aren't set:
+Every `*-qa` project's CI workflow calls this repo's reusable **[`publish-results` composite action](.github/actions/publish-results/action.yml)** (`uses: bertramdev/qa-automation-dashboard/.github/actions/publish-results@main`) from the job that currently emails run results, passing in the metrics that job already computed. The action is **destination-agnostic**: it builds one canonical result JSON object, then hands it to whichever "sinks" are configured via that step's inputs. Today there is one sink, optional and a silent no-op (never fails the calling job) when its credentials aren't set:
 
 - **GitHub dashboard sink** — appends the result to this repo's `data/<project>.json` via the GitHub Contents API (get current file SHA, append, PUT — retried a few times on conflict). `index.html` (plain HTML/JS, Chart.js via CDN, no build step) fetches each project's `data/<project>.json` directly — same-origin and rate-limit-free once served from GitHub Pages — and renders the two views client-side.
-- **monday.com sink** — a template/reference implementation (see "Adding a new sink" below) that creates one board item per run via monday's `create_item` GraphQL mutation. Not yet exercised against a real board — no board or column schema has been defined for this org.
-- **Grafana Loki sink** — pushes the canonical result as one structured JSON log line via Loki's push API (`POST <grafana_loki_url>/loki/api/v1/push`), labeled by `project`/`environment`/`browser`/`status` only (deliberately low-cardinality — `run_id`/`commit_sha`/etc. stay inside the log line, not as labels, since Loki bills/indexes by label cardinality). A Grafana dashboard queries the numeric fields back out via LogQL's `| json` parser + `unwrap`, so no separate Prometheus/InfluxDB backend is required just to graph pass/fail/flaky/elapsed-seconds/cost trends. Not yet exercised against a real Loki instance — no endpoint/credentials have been provisioned for this org yet. Optionally, when a caller also passes `spec_timings_json`, this sink pushes a **second** stream in the same request — one log line per spec (duration, and optionally per-spec pass/fail if the caller has it), labeled `type="spec"` instead of `status` — so per-spec execution-time trends and slowest-spec panels don't require a separate metrics backend either. See "Data schema" below.
 
-A calling workflow only ever passes in already-computed metrics; it never needs to know which sinks exist or how they work. Adding a fourth destination later (or swapping which one is actually live) means changing this one action, not every project's workflow.
+A calling workflow only ever passes in already-computed metrics; it never needs to know which sinks exist or how they work. Adding a new destination later means changing this one action, not every project's workflow.
+
+There were previously two other sinks here — a monday.com board item and a Grafana Loki push (plus an optional per-spec-timing stream) — both removed as unused: neither ever had real credentials provisioned, no `*-qa` project called this action with monday.com inputs set, and every project that once called this action for the Loki sink has since moved to its own direct Cypress→Grafana pipeline instead (e.g. `equivate-qa`'s `cypress/support/grafana-reporter`, publishing to Azure Monitor Logs, not through this action at all).
 
 ## Data schema
 
-The composite action's "Build canonical result JSON" step produces one entry shaped like this — it's both what the GitHub dashboard sink appends to `data/<project>.json` and the source data the monday.com sink (or any future sink) works from:
+The composite action's "Build canonical result JSON" step produces one entry shaped like this — it's both what the GitHub dashboard sink appends to `data/<project>.json` and the source data any future sink would work from:
 
 ```json
 {
@@ -39,21 +39,6 @@ The composite action's "Build canonical result JSON" step produces one entry sha
   "cloud_url": null
 }
 ```
-
-### Optional per-spec data (Grafana Loki sink only)
-
-A caller may also pass `spec_timings_json` — a JSON array, one entry per spec, e.g.:
-
-```json
-[
-  { "spec": "01-login.cy.js", "duration_seconds": 42.1 },
-  { "spec": "02-nav.cy.js", "duration_seconds": 17.8 }
-]
-```
-
-Unlike the canonical result above, this is **not** part of the schema the GitHub-dashboard or monday.com sinks read — it never gets appended to `data/<project>.json` (that file is git-committed and grows forever; multiplying every entry by spec count isn't worth it for data no sink but Grafana uses). Instead, when both `spec_timings_json` and the Grafana Loki sink are active, the action pushes it as a **second Loki stream** in the same request — one log line per spec, each merged with `project`/`environment`/`browser`/`run_id`/`run_url`/`commit_sha` so it's independently queryable, and labeled `type="spec"` (instead of `status`) to keep it out of the run-level stream. A caller can include any other fields per spec too (e.g. a per-spec `status` if it has one) — the action passes each object through as-is aside from the merged fields above. Leaving `spec_timings_json` unset skips this stream entirely — same no-op-never-fails behavior as every other optional input.
-
-Where to source it from: most `*-qa` projects already build a per-spec timing file for parallel bin-packing (e.g. `cypress-spec-timings.json` in `leftlane-wheelhouse-qa`) — that file's shape maps directly to this input with a small `jq` reshape in the calling workflow.
 
 ## Adding a new project
 
@@ -81,23 +66,19 @@ Where to source it from: most `*-qa` projects already build a per-spec timing fi
        commit_sha: ${{ env.DASHBOARD_COMMIT_SHA }}
        cloud_url: ${{ env.DASHBOARD_CLOUD_URL }}
        dashboard_token: ${{ secrets.DASHBOARD_TOKEN }}
-       grafana_loki_url: ${{ secrets.GRAFANA_LOKI_URL }}
-       grafana_loki_user: ${{ secrets.GRAFANA_LOKI_USER }}
-       grafana_loki_token: ${{ secrets.GRAFANA_LOKI_TOKEN }}
-       spec_timings_json: ${{ env.DASHBOARD_SPEC_TIMINGS_JSON }}  # optional, Grafana Loki sink only — see "Data schema" above
    ```
-   See any of `leftlane-wheelhouse-qa`, `equivate-qa`, `ridgeline-insurance-app-qa`, or `mse-zendesk-app-qa`'s `.github/workflows/cypress.yml` for a working reference — each already has this wired in (as a no-op, pending step 3 below and/or "Going live" below).
+   No `*-qa` project currently calls this action — each one that briefly wired it in (`leftlane-wheelhouse-qa`, `equivate-qa`, `ridgeline-insurance-app-qa`, `mse-zendesk-app-qa`) has since disconnected it, and `equivate-qa` now publishes directly to Grafana via its own `cypress/support/grafana-reporter` instead. The snippet above is a template to follow, not a reference to an existing working call site.
 3. Add a `DASHBOARD_TOKEN` secret to that project's repo — a fine-grained GitHub PAT scoped to `Contents: Read and write` on this repo only — to actually turn the GitHub-dashboard sink on for that project.
 
 ## Adding a new sink
 
-A "sink" is one destination for the canonical result JSON — the GitHub-dashboard append and the monday.com `create_item` call are both examples. To add another (a different SaaS tool, Slack, a data warehouse, etc.), edit only `.github/actions/publish-results/action.yml`:
+A "sink" is one destination for the canonical result JSON — the GitHub-dashboard append is the one example currently in the file. To add another (a different SaaS tool, Slack, a data warehouse, etc.), edit only `.github/actions/publish-results/action.yml`:
 
 1. Add an optional input pair for whatever credential/target the new sink needs (e.g. `xyz_token`, `xyz_target_id`), each defaulting to `''` so it's opt-in.
-2. Add one step: `if: always() && inputs.xyz_token != ''`, consuming `steps.build.outputs.json` (the canonical result) and sending it however that destination expects. Never fail the job on that sink's failure — `echo "::warning::..."` instead, matching the existing two sinks.
+2. Add one step: `if: always() && inputs.xyz_token != ''`, consuming `steps.build.outputs.json` (the canonical result) and sending it however that destination expects. Never fail the job on that sink's failure — `echo "::warning::..."` instead, matching the existing sink.
 3. Add a matching `published_xyz` output if callers might want to check whether that sink succeeded.
 
-No calling workflow needs to change — every `*-qa` project already calls this action, so a new sink goes live for all of them the moment its credentials are configured, without touching a single project's `cypress.yml` again.
+No calling workflow needs to change once one does call this action — a new sink goes live for every caller the moment its credentials are configured, without touching any project's `cypress.yml` again.
 
 ## Going live
 
@@ -105,8 +86,7 @@ Independent switches, none flipped yet:
 
 1. **Enable GitHub Pages** on this repo (Settings → Pages → source: `main` branch, `/` root) to get a public URL for `index.html`.
 2. **Provision a `DASHBOARD_TOKEN`** (fine-grained PAT, `Contents: Read and write`, scoped to this repo only) and add it as a secret on each `*-qa` project that should publish to the GitHub-dashboard sink.
-3. **Or/also provision monday.com credentials** (`monday_api_token`, `monday_board_id`, and a `monday_column_values` mapping once a real board/schema exists) if that sink is the one to go live with instead of or alongside the GitHub dashboard.
-4. **Or/also provision Grafana Loki credentials** to go live with that sink: a `GRAFANA_LOKI_URL` (the Loki instance's base URL — for Grafana Cloud, find this on the stack's "Details" page under the Loki data source, labeled "URL"), a `GRAFANA_LOKI_USER` (Grafana Cloud: the numeric Loki instance/tenant ID shown on that same page — leave unset for a self-hosted Loki that authenticates via bearer token instead), and a `GRAFANA_LOKI_TOKEN` (Grafana Cloud: an API key/access policy token with Loki write scope; self-hosted: whatever bearer token the endpoint expects). Add all three as secrets on each `*-qa` project that should publish to this sink. Once live, in Grafana: add a Loki data source pointed at the same URL, then build panels/dashboards using LogQL against the `job="qa-automation-dashboard"` stream, filtered by the `project`/`environment`/`browser`/`status` labels and `| json | unwrap <field>` for numeric panels (e.g. `passed`, `failed`, `flaky`, `elapsed_seconds`, `cost_usd`). If a caller also sends `spec_timings_json`, per-spec panels (e.g. slowest specs, spec-duration trend) come from the same data source filtered to `type="spec"` instead of `status`, e.g. `{job="qa-automation-dashboard", project="leftlane-wheelhouse-qa", type="spec"} | json | unwrap duration_seconds`.
+3. **At least one `*-qa` project needs to call the action again** (see "Adding a new project" above) — none currently do.
 
 ## Data retention
 
